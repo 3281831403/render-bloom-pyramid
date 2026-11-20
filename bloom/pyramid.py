@@ -15,6 +15,32 @@ class BloomError(ValueError):
     """Raised when an image, pyramid, or parameter violates its contract."""
 
 
+def _validate_image(img, name="img"):
+    """Check the common image contract, returning ``(height, width)``."""
+    if not isinstance(img, (list, tuple)) or len(img) == 0:
+        raise BloomError(f"{name} must be a non-empty list of rows")
+    width = None
+    for row in img:
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            raise BloomError(f"{name} rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise BloomError(f"{name} must be rectangular (ragged rows)")
+        for value in row:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise BloomError(f"{name} pixels must be real numbers")
+            if not math.isfinite(value):
+                raise BloomError(f"{name} pixels must be finite")
+            if value < 0.0 or value > 1.0:
+                raise BloomError(f"{name} pixels must lie in [0.0, 1.0]")
+    return len(img), width
+
+
+def _copy_image(img):
+    return [list(row) for row in img]
+
+
 def threshold(img: list[list[float]], threshold: float, knee: float) -> list[list[float]]:
     """Apply a linear-light soft threshold and return a new image.
 
@@ -38,8 +64,34 @@ def threshold(img: list[list[float]], threshold: float, knee: float) -> list[lis
     the piecewise definition within ``1e-6``; this is intentionally a soft
     threshold so bright edges do not become blocky.
     """
+    _validate_image(img)
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) \
+            or not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise BloomError("threshold must be a finite value in [0.0, 1.0]")
+    if not isinstance(knee, (int, float)) or isinstance(knee, bool) \
+            or not math.isfinite(knee) or not 0.0 <= knee <= threshold:
+        raise BloomError("knee must satisfy 0.0 <= knee <= threshold")
 
-    raise NotImplementedError("threshold is not implemented")
+    threshold = float(threshold)
+    knee = float(knee)
+    lo = threshold - knee
+    hi = threshold + knee
+
+    out = []
+    for row in img:
+        out_row = []
+        for v in row:
+            if knee == 0.0:
+                out_row.append(0.0 if v <= threshold else v - threshold)
+            elif v <= lo:
+                out_row.append(0.0)
+            elif v >= hi:
+                out_row.append(v - threshold)
+            else:
+                u = (v - lo) / (2.0 * knee)
+                out_row.append(knee * u * u)
+        out.append(out_row)
+    return out
 
 
 def downsample(img: list[list[float]]) -> list[list[float]]:
@@ -54,8 +106,27 @@ def downsample(img: list[list[float]]) -> list[list[float]]:
     including the final column or row, is discarded. Pooling is linear and the
     result must match within ``1e-6``.
     """
+    height, width = _validate_image(img)
+    out_h = (height + 1) // 2
+    out_w = (width + 1) // 2
 
-    raise NotImplementedError("downsample is not implemented")
+    out = []
+    for y in range(out_h):
+        out_row = []
+        for x in range(out_w):
+            total = 0.0
+            count = 0
+            for sy in (2 * y, 2 * y + 1):
+                if sy >= height:
+                    continue
+                for sx in (2 * x, 2 * x + 1):
+                    if sx >= width:
+                        continue
+                    total += img[sy][sx]
+                    count += 1
+            out_row.append(total / count)
+        out.append(out_row)
+    return out
 
 
 def upsample(img: list[list[float]], size: tuple[int, int]) -> list[list[float]]:
@@ -74,8 +145,48 @@ def upsample(img: list[list[float]], size: tuple[int, int]) -> list[list[float]]
     coordinates blend the adjacent samples. Interpolation is linear and the
     result must match within ``1e-6``.
     """
+    src_h, src_w = _validate_image(img)
+    if not isinstance(size, (list, tuple)) or len(size) != 2:
+        raise BloomError("size must be a (height, width) pair")
+    dst_h, dst_w = size
+    for dim in (dst_h, dst_w):
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim < 1:
+            raise BloomError("target dimensions must be positive integers")
 
-    raise NotImplementedError("upsample is not implemented")
+    def source_coord(i, src_extent, dst_extent):
+        if dst_extent > 1:
+            coord = i * (src_extent - 1) / (dst_extent - 1)
+        else:
+            coord = 0.0
+        return min(max(coord, 0.0), src_extent - 1)
+
+    out = []
+    for y in range(dst_h):
+        sy = source_coord(y, src_h, dst_h)
+        y0 = int(math.floor(sy))
+        y1 = min(y0 + 1, src_h - 1)
+        fy = sy - y0
+        out_row = []
+        for x in range(dst_w):
+            sx = source_coord(x, src_w, dst_w)
+            x0 = int(math.floor(sx))
+            x1 = min(x0 + 1, src_w - 1)
+            fx = sx - x0
+            top = img[y0][x0] * (1.0 - fx) + img[y0][x1] * fx
+            bottom = img[y1][x0] * (1.0 - fx) + img[y1][x1] * fx
+            out_row.append(top * (1.0 - fy) + bottom * fy)
+        out.append(out_row)
+    return out
+
+
+def _max_levels(height, width):
+    """Depth available while both dimensions strictly shrink by ceil-half."""
+    levels = 1
+    while height > 1 and width > 1:
+        height = (height + 1) // 2
+        width = (width + 1) // 2
+        levels += 1
+    return levels
 
 
 def build_pyramid(img: list[list[float]], levels: int) -> list:
@@ -96,8 +207,22 @@ def build_pyramid(img: list[list[float]], levels: int) -> list:
     layers. The result is a list of images with strictly decreasing dimensions,
     and values must match repeated downsampling within ``1e-6``.
     """
+    height, width = _validate_image(img)
+    if not isinstance(levels, int) or isinstance(levels, bool):
+        raise BloomError("levels must be an integer")
+    limit = _max_levels(height, width)
+    if levels < 1:
+        raise BloomError("levels must be at least 1")
+    if levels > limit:
+        raise BloomError(
+            f"levels={levels} exceeds the strictly shrinking depth {limit} "
+            f"for a {height}x{width} image"
+        )
 
-    raise NotImplementedError("build_pyramid is not implemented")
+    pyramid = [_copy_image(img)]
+    for _ in range(levels - 1):
+        pyramid.append(downsample(pyramid[-1]))
+    return pyramid
 
 
 def combine(pyramid: list[list[list[float]]], weights: list[float]) -> list[list[float]]:
@@ -117,8 +242,37 @@ def combine(pyramid: list[list[list[float]]], weights: list[float]) -> list[list
     exactly layer 0's dimensions and values in ``[0.0, 1.0]``; results must
     match within ``1e-6``.
     """
+    if not isinstance(pyramid, (list, tuple)) or len(pyramid) == 0:
+        raise BloomError("pyramid must be a non-empty list of layers")
+    for layer in pyramid:
+        _validate_image(layer, name="pyramid layer")
+    if not isinstance(weights, (list, tuple)) or len(weights) != len(pyramid):
+        raise BloomError("weights must contain one value per layer")
+    for w in weights:
+        if not isinstance(w, (int, float)) or isinstance(w, bool) \
+                or not math.isfinite(w) or w < 0.0:
+            raise BloomError("weights must be finite and non-negative")
+    total = float(sum(weights))
+    if total <= 0.0:
+        raise BloomError("weights must have a positive total")
 
-    raise NotImplementedError("combine is not implemented")
+    base_h, base_w = len(pyramid[0]), len(pyramid[0][0])
+    resampled = [
+        layer if (len(layer), len(layer[0])) == (base_h, base_w)
+        else upsample(layer, (base_h, base_w))
+        for layer in pyramid
+    ]
+
+    out = []
+    for y in range(base_h):
+        out_row = []
+        for x in range(base_w):
+            acc = 0.0
+            for layer, w in zip(resampled, weights):
+                acc += w * layer[y][x]
+            out_row.append(acc / total)
+        out.append(out_row)
+    return out
 
 
 def apply_bloom(
@@ -148,8 +302,28 @@ def apply_bloom(
     Operations are linear-light. Non-exact values must match within ``1e-6``;
     the all-black and strength-zero identity cases are the explicit exceptions.
     """
+    _validate_image(img)
+    if not isinstance(strength, (int, float)) or isinstance(strength, bool) \
+            or not math.isfinite(strength):
+        raise BloomError("strength must be a finite number")
+    strength = min(max(float(strength), 0.0), 1.0)
 
-    raise NotImplementedError("apply_bloom is not implemented")
+    if strength == 0.0:
+        return _copy_image(img)
+    if all(value == 0.0 for row in img for value in row):
+        return _copy_image(img)
+
+    bright = globals()["threshold"](img, threshold, 0.1 * threshold)
+    pyramid = build_pyramid(bright, levels)
+    bloom = combine(pyramid, [1.0] * len(pyramid))
+
+    out = []
+    for img_row, bloom_row in zip(img, bloom):
+        out_row = []
+        for v, b in zip(img_row, bloom_row):
+            out_row.append(min(max(v + strength * b, 0.0), 1.0))
+        out.append(out_row)
+    return out
 
 
 def validate_pyramid(pyramid: list[list[list[float]]]) -> list[str]:
@@ -167,8 +341,46 @@ def validate_pyramid(pyramid: list[list[list[float]]]) -> list[str]:
     Sizes are integer structural properties and are checked exactly. Numeric
     bloom contracts elsewhere use an absolute tolerance of ``1e-6``.
     """
+    issues = []
+    if not isinstance(pyramid, (list, tuple)) or len(pyramid) == 0:
+        return ["pyramid is empty: no levels"]
 
-    raise NotImplementedError("validate_pyramid is not implemented")
+    shapes = []
+    for index, layer in enumerate(pyramid):
+        if not isinstance(layer, (list, tuple)) or len(layer) == 0:
+            issues.append(f"layer {index} is empty")
+            shapes.append(None)
+            continue
+        width = len(layer[0]) if isinstance(layer[0], (list, tuple)) else 0
+        if width == 0:
+            issues.append(f"layer {index} has empty rows")
+            shapes.append(None)
+            continue
+        if any(not isinstance(row, (list, tuple)) or len(row) != width for row in layer):
+            issues.append(f"layer {index} is ragged (non-rectangular)")
+            shapes.append(None)
+            continue
+        shapes.append((len(layer), width))
+
+    known = [shape for shape in shapes if shape is not None]
+    for index in range(1, len(shapes)):
+        prev, cur = shapes[index - 1], shapes[index]
+        if prev is None or cur is None:
+            continue
+        if cur[0] >= prev[0] or cur[1] >= prev[1]:
+            issues.append(
+                f"layers {index - 1} and {index} are not strictly decreasing: "
+                f"{prev[0]}x{prev[1]} -> {cur[0]}x{cur[1]}"
+            )
+
+    if shapes[0] is not None:
+        limit = _max_levels(*shapes[0])
+        if len(pyramid) > limit:
+            issues.append(
+                f"pyramid has {len(pyramid)} levels but layer 0 geometry "
+                f"{shapes[0][0]}x{shapes[0][1]} supports at most {limit}"
+            )
+    return issues
 
 
 def bloom_batch(images: list[list[list[float]]], config: dict) -> dict:
@@ -191,5 +403,45 @@ def bloom_batch(images: list[list[list[float]]], config: dict) -> dict:
     with no partial results. Do not raise for per-image data errors. Results
     must match individual :func:`apply_bloom` calls within ``1e-6``.
     """
+    failure = {"ok": False, "results": [], "errors": []}
 
-    raise NotImplementedError("bloom_batch is not implemented")
+    if not isinstance(images, (list, tuple)) or len(images) == 0:
+        failure["errors"].append("images must be a non-empty list")
+        return failure
+
+    expected_keys = {"threshold", "levels", "strength"}
+    if not isinstance(config, dict):
+        failure["errors"].append("config must be a mapping")
+        return failure
+    if set(config.keys()) != expected_keys:
+        failure["errors"].append(
+            f"config must have exactly the keys {sorted(expected_keys)}"
+        )
+        return failure
+
+    # Validate every image before producing any output.
+    for index, img in enumerate(images):
+        try:
+            _validate_image(img, name=f"images[{index}]")
+        except BloomError as exc:
+            failure["errors"].append(f"image {index}: {exc}")
+    if failure["errors"]:
+        return failure
+
+    results = []
+    for index, img in enumerate(images):
+        try:
+            results.append(apply_bloom(
+                img,
+                config["threshold"],
+                config["levels"],
+                config["strength"],
+            ))
+        except BloomError as exc:
+            failure["errors"].append(f"image {index}: {exc}")
+            return failure
+        except (TypeError, ValueError) as exc:
+            failure["errors"].append(f"image {index}: {exc}")
+            return failure
+
+    return {"ok": True, "results": results, "errors": []}
